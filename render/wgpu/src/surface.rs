@@ -198,10 +198,11 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Shader(shader),
                     needs_stencil,
+                    bounds: _,
                 } => {
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
                     let parent_blend_buffer =
-                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder, None);
                     run_pixelbender_shader_impl(
                         descriptors,
                         shader,
@@ -234,6 +235,7 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Complex(blend_mode),
                     needs_stencil,
+                    bounds,
                 } => {
                     let parent = match blend_mode {
                         ComplexBlend::Alpha | ComplexBlend::Erase => {
@@ -250,7 +252,7 @@ impl Surface {
                     };
 
                     let parent_blend_buffer =
-                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder, bounds);
 
                     let blend_bind_group =
                         descriptors
@@ -341,6 +343,21 @@ impl Surface {
                         descriptors.quad.indices.slice(..),
                         wgpu::IndexFormat::Uint32,
                     );
+
+                    // Every complex blend shader leaves the destination
+                    // untouched wherever the blended content is transparent
+                    // (see e.g. overlay.wgsl's `discard` branch), so
+                    // restricting this composite to the content's own
+                    // bounds is safe and avoids paying full-canvas fill
+                    // cost for objects that only cover a small area.
+                    if let Some(bounds) = bounds {
+                        render_pass.set_scissor_rect(
+                            bounds.x_min,
+                            bounds.y_min,
+                            bounds.x_max - bounds.x_min,
+                            bounds.y_max - bounds.y_min,
+                        );
+                    }
 
                     render_pass.draw_indexed(0..6, 0, 0..1);
                 }
