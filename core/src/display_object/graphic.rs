@@ -20,6 +20,7 @@ use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
 use std::cell::{OnceCell, RefCell, RefMut};
 use std::sync::Arc;
+use web_time::Instant;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -150,14 +151,28 @@ impl<'gc> Graphic<'gc> {
             }
         }
 
+        // Retessellating is deferrable work: if many previously-unseen shapes
+        // become visible in the same frame (e.g. walking into a new part of
+        // a level), retessellating all of them synchronously can take long
+        // enough to cause visible/audible stutter. Once the frame's budget
+        // is used up, fall back to the shape's default-scale tessellation
+        // (still correct, just not optimal quality at this scale) and defer
+        // the retessellation to a later frame - `get_or_retessellate_handle`
+        // will simply be called again next time this shape renders.
+        if !context.tessellation_budget.has_budget() {
+            return base_handle.clone();
+        }
+
         // Retessellate at the new scale
         let library = context.library.library_for_movie(shared.movie.clone());
         if let Some(library) = library {
+            let start = Instant::now();
             let new_handle = context.renderer.register_shape_with_scale(
                 (&shared.shape).into(),
                 &MovieLibrarySource { library },
                 current_scale,
             );
+            context.tessellation_budget.consume(start.elapsed());
 
             {
                 let mut cache = shared.scaled_handle.borrow_mut();

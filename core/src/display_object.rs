@@ -1081,6 +1081,11 @@ pub fn render_base<'gc>(
                 is_offscreen: true,
                 use_bitmap_cache: true,
                 stage: context.stage,
+                // Share the outer context's budget rather than giving this
+                // nested cacheAsBitmap render its own - otherwise a frame
+                // could do a full budget's worth of retessellation in the
+                // main pass, then another full budget's worth again here.
+                tessellation_budget: context.tessellation_budget,
             };
             this.render_self(&mut offscreen_context);
             offscreen_context.cache_draws.push(BitmapCacheEntry {

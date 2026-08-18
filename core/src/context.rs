@@ -41,6 +41,7 @@ use crate::timer::Timers;
 use crate::vminterface::Instantiator;
 use async_channel::Sender;
 use core::fmt;
+use std::cell::Cell;
 use enum_map::Enum;
 use enum_map::EnumMap;
 use gc_arena::{Collect, Mutation};
@@ -562,6 +563,61 @@ impl Default for ActionQueue<'_> {
     }
 }
 
+/// A best-effort cap on how much wall-clock time a single frame's render pass
+/// may spend doing expensive, deferrable rendering setup work - currently
+/// just shape retessellation (see `Graphic::get_or_retessellate_handle`).
+///
+/// Without this, walking into a part of a level with many previously-unseen
+/// shapes can force dozens of retessellations in a single frame, which can
+/// take long enough to starve the audio backend's buffer-refill callback
+/// (since both run on the same thread), producing audible dropouts on top
+/// of the visual stutter. Once the budget for a frame is exhausted, further
+/// retessellation is deferred to a later frame; callers should fall back
+/// to *something* renderable (e.g. the shape's default-scale tessellation)
+/// rather than skipping the draw entirely.
+///
+/// This is shared (not reset) across nested `RenderContext`s that exist
+/// within the same frame - e.g. the offscreen context used to rebuild a
+/// `cacheAsBitmap` object's cache - so the cap applies to the frame's total
+/// tessellation work, not to each nested context independently.
+pub struct TessellationBudget {
+    remaining: Cell<Duration>,
+}
+
+impl TessellationBudget {
+    /// The default per-frame budget. Chosen to be a small fraction of a
+    /// 60fps frame (16.67ms), leaving the majority of the frame for actual
+    /// rendering, game logic, and (crucially) letting the audio buffer
+    /// refill callback run on schedule.
+    pub const DEFAULT_PER_FRAME: Duration = Duration::from_millis(4);
+
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            remaining: Cell::new(budget),
+        }
+    }
+
+    /// A budget that never runs out, for one-off render passes (like
+    /// `BitmapData.draw`) that aren't part of the regular per-frame render
+    /// loop and whose output the caller may rely on being fully correct.
+    pub fn unlimited() -> Self {
+        Self {
+            remaining: Cell::new(Duration::MAX),
+        }
+    }
+
+    /// Returns `true` if there's budget left to justify doing more
+    /// deferrable work this frame.
+    pub fn has_budget(&self) -> bool {
+        !self.remaining.get().is_zero()
+    }
+
+    /// Deducts `elapsed` from the remaining budget, saturating at zero.
+    pub fn consume(&self, elapsed: Duration) {
+        self.remaining.set(self.remaining.get().saturating_sub(elapsed));
+    }
+}
+
 /// Shared data used during rendering.
 /// `Player` creates this when it renders a frame and passes it down to display objects.
 ///
@@ -594,6 +650,10 @@ pub struct RenderContext<'a, 'gc> {
 
     /// The current player's stage (including all loaded levels)
     pub stage: Stage<'gc>,
+
+    /// Caps how much time this frame may spend on deferrable rendering
+    /// setup work (currently shape retessellation). See `TessellationBudget`.
+    pub tessellation_budget: &'a TessellationBudget,
 }
 
 impl<'gc> RenderContext<'_, 'gc> {
