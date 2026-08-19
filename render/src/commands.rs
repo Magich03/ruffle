@@ -1,5 +1,5 @@
 use crate::backend::ShapeHandle;
-use crate::bitmap::{BitmapHandle, PixelSnapping};
+use crate::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
 use crate::matrix::Matrix;
 use crate::pixel_bender::PixelBenderShaderHandle;
 use crate::transform::Transform;
@@ -24,7 +24,20 @@ pub trait CommandHandler {
     fn deactivate_mask(&mut self);
     fn pop_mask(&mut self);
 
-    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode);
+    /// `bounds`, when given, is a hint that the blended content is fully
+    /// contained within this pixel-space rectangle. Renderers may use it to
+    /// avoid doing full-canvas-sized work (backdrop snapshots, shader
+    /// passes) for a blend that only actually affects a small area - the
+    /// blend result must still be correct if the hint is ignored or if
+    /// `None` is passed, since pixels outside the drawn content of
+    /// `commands` never affect the composited result (blend shaders leave
+    /// the destination untouched wherever the drawn content is transparent).
+    fn blend(
+        &mut self,
+        commands: CommandList,
+        blend_mode: RenderBlendMode,
+        bounds: Option<PixelRegion>,
+    );
 }
 
 /// Holds either a normal BlendMode, or the shader for BlendMode.SHADER.
@@ -78,7 +91,9 @@ impl CommandList {
                 Command::ActivateMask => handler.activate_mask(),
                 Command::DeactivateMask => handler.deactivate_mask(),
                 Command::PopMask => handler.pop_mask(),
-                Command::Blend(commands, blend_mode) => handler.blend(commands, blend_mode),
+                Command::Blend(commands, blend_mode, bounds) => {
+                    handler.blend(commands, blend_mode, bounds)
+                }
                 Command::RenderAlphaMask {
                     maskee_commands,
                     mask_commands,
@@ -190,9 +205,15 @@ impl CommandHandler for CommandList {
     }
 
     #[inline]
-    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
+    fn blend(
+        &mut self,
+        commands: CommandList,
+        blend_mode: RenderBlendMode,
+        bounds: Option<PixelRegion>,
+    ) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::Blend(commands, blend_mode));
+            self.commands
+                .push(Command::Blend(commands, blend_mode, bounds));
         }
     }
 }
@@ -233,5 +254,5 @@ pub enum Command {
     ActivateMask,
     DeactivateMask,
     PopMask,
-    Blend(CommandList, RenderBlendMode),
+    Blend(CommandList, RenderBlendMode, Option<PixelRegion>),
 }

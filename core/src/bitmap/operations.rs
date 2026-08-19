@@ -7,7 +7,7 @@ use crate::bitmap::bitmap_data::{
     LehmerRng, ThresholdOperation,
 };
 use crate::bitmap::turbulence::Turbulence;
-use crate::context::{RenderContext, UpdateContext};
+use crate::context::{RenderContext, TessellationBudget, UpdateContext};
 use crate::display_object::{RenderOptions, TDisplayObject};
 use gc_arena::Mutation;
 use ruffle_render::backend::RenderBackend;
@@ -1528,6 +1528,10 @@ pub fn draw<'gc>(
     transform_stack.push(&transform);
 
     let mut cache_draws = vec![];
+    // This isn't part of the regular per-frame render loop, and its output
+    // (the drawn BitmapData) needs to be fully correct rather than
+    // best-effort, so it isn't subject to the per-frame tessellation budget.
+    let tessellation_budget = TessellationBudget::unlimited();
     let mut render_context = RenderContext {
         renderer: context.renderer,
         commands: CommandList::new(),
@@ -1538,6 +1542,7 @@ pub fn draw<'gc>(
         is_offscreen: true,
         use_bitmap_cache: false,
         stage: context.stage,
+        tessellation_budget: &tessellation_budget,
     };
 
     // Make the screen opacity match the opacity of this bitmap
@@ -1596,6 +1601,7 @@ pub fn draw<'gc>(
         commands.blend(
             render_context.commands,
             RenderBlendMode::Builtin(blend_mode),
+            None,
         );
         commands
     };

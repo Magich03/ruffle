@@ -9,12 +9,13 @@ use crate::avm2::globals::flash::display::display_object::initialize_for_allocat
 use crate::avm2::globals::slots::flash_display_loader as loader_slots;
 use crate::avm2::globals::slots::flash_net_url_request as url_request_slots;
 use crate::avm2::globals::slots::flash_net_url_request_header as url_request_header_slots;
+use crate::avm2::object::EventObject;
 use crate::avm2::object::LoaderInfoObject;
 use crate::avm2::object::LoaderStream;
 use crate::avm2::object::TObject as _;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
-use crate::avm2::{Error, Object};
+use crate::avm2::{Avm2, Error, Object};
 use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
@@ -308,9 +309,6 @@ pub fn unload<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    // TODO: Broadcast an "unload" event on the LoaderInfo
-    avm2_stub_method!(activation, "flash.display.Loader", "unload");
-
     let loader_info = this
         .get_slot(loader_slots::_CONTENT_LOADER_INFO)
         .as_object()
@@ -318,7 +316,16 @@ pub fn unload<'gc>(
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
 
+    let had_content = loader_info.init_event_fired();
+
     loader_info.unload(activation.context);
+
+    // Flash Player only dispatches `unload` if the Loader actually had
+    // content loaded; unloading an already-empty Loader is a no-op.
+    if had_content {
+        let unload_evt = EventObject::bare_default_event(activation.context, "unload");
+        Avm2::dispatch_event(activation.context, unload_evt, loader_info.into());
+    }
 
     Ok(Value::Undefined)
 }

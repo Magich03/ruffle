@@ -9,7 +9,7 @@ use crate::surface::Surface;
 use crate::surface::target::CommandTarget;
 use crate::{Descriptors, MaskState, Pipelines, Transforms, as_texture};
 use ruffle_render::backend::ShapeHandle;
-use ruffle_render::bitmap::{BitmapHandle, PixelSnapping};
+use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
@@ -444,6 +444,9 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        /// Pixel-space bounds hint, clamped to the canvas. See
+        /// `CommandHandler::blend`'s docs for what this means.
+        bounds: Option<PixelRegion>,
     },
 }
 
@@ -674,7 +677,27 @@ impl<'a> WgpuCommandHandler<'a> {
 }
 
 impl CommandHandler for WgpuCommandHandler<'_> {
-    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
+    fn blend(
+        &mut self,
+        commands: CommandList,
+        blend_mode: RenderBlendMode,
+        bounds: Option<PixelRegion>,
+    ) {
+        // Clamp the hinted bounds to the actual canvas, in case the object
+        // extends offscreen. An empty/degenerate result just means "no
+        // useful hint" and falls back to the full-canvas behavior below.
+        let bounds = bounds.and_then(|bounds| {
+            let x_min = bounds.x_min.min(self.width);
+            let y_min = bounds.y_min.min(self.height);
+            let x_max = bounds.x_max.min(self.width);
+            let y_max = bounds.y_max.min(self.height);
+            (x_max > x_min && y_max > y_min).then_some(PixelRegion {
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+            })
+        });
         let surface = Surface::new(
             self.descriptors,
             self.quality,
@@ -782,6 +805,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    bounds,
                 });
                 self.needs_stencil = self.num_masks > 0;
             }

@@ -120,6 +120,12 @@ impl Drawing {
         self.new_fill(style, rule);
     }
 
+    /// The fill style currently active (set via `set_fill_style`/`new_fill` and
+    /// not yet closed out), if any.
+    pub fn current_fill_style(&self) -> Option<&FillStyle> {
+        self.current_fill.as_ref().map(|fill| &fill.style)
+    }
+
     /// Set fill style and rule.
     pub fn new_fill(&mut self, style: Option<FillStyle>, rule: Option<FillRule>) {
         self.close_path();

@@ -61,7 +61,7 @@ pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;
 pub use movie_clip::{MovieClip, MovieClipHandle, MovieClipWeak, Scene};
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
-use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelSnapping};
+use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelRegion, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::filters::Filter;
@@ -1081,6 +1081,11 @@ pub fn render_base<'gc>(
                 is_offscreen: true,
                 use_bitmap_cache: true,
                 stage: context.stage,
+                // Share the outer context's budget rather than giving this
+                // nested cacheAsBitmap render its own - otherwise a frame
+                // could do a full budget's worth of retessellation in the
+                // main pass, then another full budget's worth again here.
+                tessellation_budget: context.tessellation_budget,
             };
             this.render_self(&mut offscreen_context);
             offscreen_context.cache_draws.push(BitmapCacheEntry {
@@ -1150,7 +1155,24 @@ pub fn render_base<'gc>(
             } else {
                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
             };
-            context.commands.blend(sub_commands, render_blend_mode);
+            // Renderers can use this to avoid doing full-canvas-sized work
+            // for a blend that only actually affects a small area (e.g. one
+            // decoration in a large cacheAsBitmap-cached level). This is
+            // purely a hint: it's fine if it's larger than the true bounds,
+            // it just needs to fully contain everything `sub_commands` draws.
+            let bounds = {
+                let current_transform = context.transform_stack.transform();
+                let render_bounds = this.render_bounds_with_transform(
+                    &current_transform.matrix,
+                    false,
+                    &context.stage.view_matrix(),
+                );
+                Some(PixelRegion::encompassing_twips(
+                    (render_bounds.x_min, render_bounds.y_min),
+                    (render_bounds.x_max, render_bounds.y_max),
+                ))
+            };
+            context.commands.blend(sub_commands, render_blend_mode, bounds);
         }
     }
 

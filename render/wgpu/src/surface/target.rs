@@ -5,6 +5,7 @@ use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use crate::utils::create_buffer_with_data;
 use crate::utils::run_copy_pipeline;
+use ruffle_render::bitmap::PixelRegion;
 use std::cell::OnceCell;
 use std::sync::Arc;
 
@@ -398,11 +399,17 @@ impl CommandTarget {
         })
     }
 
+    /// `region`, when given, restricts the backdrop snapshot copy to that
+    /// pixel-space sub-rectangle instead of the whole target. This is only
+    /// safe to use when the caller *also* restricts whatever reads from the
+    /// returned `BlendBuffer` (e.g. via a scissor rect) to the same
+    /// rectangle, since pixels outside it won't contain fresh data.
     pub fn update_blend_buffer(
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
+        region: Option<PixelRegion>,
     ) -> &BlendBuffer {
         let blend_buffer = self.blend_buffer.get_or_init(|| {
             BlendBuffer::new(
@@ -416,6 +423,21 @@ impl CommandTarget {
             )
         });
         self.ensure_cleared(encoder);
+        let (origin, copy_size) = match region {
+            Some(region) => (
+                wgpu::Origin3d {
+                    x: region.x_min,
+                    y: region.y_min,
+                    z: 0,
+                },
+                wgpu::Extent3d {
+                    width: region.x_max - region.x_min,
+                    height: region.y_max - region.y_min,
+                    depth_or_array_layers: 1,
+                },
+            ),
+            None => (Default::default(), self.frame_buffer.size()),
+        };
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self
@@ -424,16 +446,16 @@ impl CommandTarget {
                     .map(|b| b.texture())
                     .unwrap_or_else(|| self.frame_buffer.texture()),
                 mip_level: 0,
-                origin: Default::default(),
+                origin,
                 aspect: Default::default(),
             },
             wgpu::TexelCopyTextureInfo {
                 texture: blend_buffer.texture(),
                 mip_level: 0,
-                origin: Default::default(),
+                origin,
                 aspect: Default::default(),
             },
-            self.frame_buffer.size(),
+            copy_size,
         );
         blend_buffer
     }

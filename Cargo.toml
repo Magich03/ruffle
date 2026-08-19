@@ -180,9 +180,18 @@ opt-level = 3
 # across "dual-wasm" builds, separating it for the two .wasm modules.
 [profile.web-wasm-mvp]
 inherits = "release"
+# Same settings as `dist` (the profile Ruffle's own official release builds
+# use): link-time optimization and single-codegen-unit compilation both let
+# LLVM optimize across the whole dependency graph instead of per-crate, for
+# a binary that's built once and run many times. Costs extra build time,
+# a fine trade for a production deploy.
+lto = true
+codegen-units = 1
 
 [profile.web-wasm-extensions]
 inherits = "release"
+lto = true
+codegen-units = 1
 
 [profile.ci]
 inherits = "release"

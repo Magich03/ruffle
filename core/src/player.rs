@@ -23,7 +23,7 @@ use crate::backend::{
 use crate::compatibility_rules::CompatibilityRules;
 use crate::compatibility_rules::UrlRewriteStage;
 use crate::config::Letterbox;
-use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext};
+use crate::context::{ActionQueue, ActionType, RenderContext, TessellationBudget, UpdateContext};
 use crate::context_menu::{
     BuiltInItemFlags, ContextMenuCallback, ContextMenuItem, ContextMenuState,
 };
@@ -2054,6 +2054,7 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
+            let tessellation_budget = TessellationBudget::new(TessellationBudget::DEFAULT_PER_FRAME);
             let mut render_context = RenderContext {
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
@@ -2064,6 +2065,7 @@ impl Player {
                 is_offscreen: false,
                 use_bitmap_cache: true,
                 stage,
+                tessellation_budget: &tessellation_budget,
             };
 
             stage.render_viewport(&mut render_context);

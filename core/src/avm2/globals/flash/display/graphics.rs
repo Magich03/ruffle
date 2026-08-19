@@ -19,11 +19,12 @@ use crate::display_object::TDisplayObject;
 use crate::drawing::Drawing;
 use crate::string::{AvmString, WStr};
 use either::Either;
+use ruffle_render::bitmap::BitmapSource;
 use ruffle_render::shape_utils::{DrawCommand, FillRule, GradientType};
 use std::f64::consts::FRAC_1_SQRT_2;
 use swf::{
-    Color, FillStyle, Fixed8, Gradient, GradientInterpolation, GradientRecord, GradientSpread,
-    LineCapStyle, LineJoinStyle, LineStyle, Matrix, Point, Twips,
+    Color, FillStyle, Fixed8, Fixed16, Gradient, GradientInterpolation, GradientRecord,
+    GradientSpread, LineCapStyle, LineJoinStyle, LineStyle, Matrix, Point, Twips,
 };
 
 /// Convert an RGB `color` and `alpha` argument pair into a `swf::Color`.
@@ -1066,15 +1067,6 @@ pub fn draw_triangles<'gc>(
             "winding behavior"
         );
 
-        if uvt_data.is_some() {
-            avm2_stub_method!(
-                activation,
-                "flash.display.Graphics",
-                "drawTriangles",
-                "with uvt data"
-            );
-        }
-
         draw_triangles_internal(
             activation,
             &mut drawing,
@@ -1115,10 +1107,17 @@ enum TriangleData {
     /// that array.
     Indexed {
         vertices: Box<[Point<Twips>]>,
+        /// Per-vertex (u, v) texture coordinates, aligned with `vertices`.
+        /// Only present if `uvtData` was supplied with a matching length.
+        uvs: Option<Box<[(f64, f64)]>>,
         indices: Box<[[u32; 3]]>,
     },
     /// Triangles described as independent vertex triples.
-    Sequential { triangles: Box<[[Point<Twips>; 3]]> },
+    Sequential {
+        triangles: Box<[[Point<Twips>; 3]]>,
+        /// Per-triangle (u, v) texture coordinates, aligned with `triangles`.
+        uvs: Option<Box<[[(f64, f64); 3]]>>,
+    },
 }
 
 impl TriangleData {
@@ -1131,6 +1130,7 @@ impl TriangleData {
         activation: &mut Activation<'_, 'gc>,
         vertices: &Object<'gc>,
         indices: Option<&Object<'gc>>,
+        uvt_data: Option<&Object<'gc>>,
     ) -> Result<Option<Self>, Error<'gc>> {
         let vertex_storage = vertices
             .as_vector_storage()
@@ -1144,6 +1144,8 @@ impl TriangleData {
         if vertex_pairs.is_empty() {
             return Ok(None);
         }
+
+        let per_vertex_uvs = uvt_data.and_then(|uvt| parse_uvt_data(uvt, vertex_pairs.len()));
 
         if let Some(indices) = indices {
             let indices_storage = indices
@@ -1178,7 +1180,11 @@ impl TriangleData {
                 return Ok(None);
             }
 
-            Ok(Some(Self::Indexed { vertices, indices }))
+            Ok(Some(Self::Indexed {
+                vertices,
+                uvs: per_vertex_uvs,
+                indices,
+            }))
         } else {
             let vertex_triples = vertex_pairs
                 .as_chunks_exact::<3>()
@@ -1189,22 +1195,46 @@ impl TriangleData {
                 .map(|[p0, p1, p2]| [make_point(p0), make_point(p1), make_point(p2)])
                 .collect::<Box<_>>();
 
-            Ok(Some(Self::Sequential { triangles }))
+            let uvs = per_vertex_uvs.map(|uvs| {
+                uvs.as_chunks_exact::<3>()
+                    .expect("uvs has same length as vertex_pairs, chunked identically")
+                    .iter()
+                    .copied()
+                    .collect::<Box<_>>()
+            });
+
+            Ok(Some(Self::Sequential { triangles, uvs }))
         }
     }
 
-    fn iter_triangles(&self) -> impl Iterator<Item = [Point<Twips>; 3]> + '_ {
+    fn iter_triangles(&self) -> impl Iterator<Item = ([Point<Twips>; 3], Option<[(f64, f64); 3]>)> + '_ {
         match self {
-            Self::Indexed { vertices, indices } => {
-                Either::Left(indices.iter().map(|&[i0, i1, i2]| {
+            Self::Indexed {
+                vertices,
+                uvs,
+                indices,
+            } => Either::Left(indices.iter().map(move |&[i0, i1, i2]| {
+                let tri = [
+                    vertices[i0 as usize],
+                    vertices[i1 as usize],
+                    vertices[i2 as usize],
+                ];
+                let uv = uvs.as_ref().map(|uvs| {
                     [
-                        vertices[i0 as usize],
-                        vertices[i1 as usize],
-                        vertices[i2 as usize],
+                        uvs[i0 as usize],
+                        uvs[i1 as usize],
+                        uvs[i2 as usize],
                     ]
-                }))
+                });
+                (tri, uv)
+            })),
+            Self::Sequential { triangles, uvs } => {
+                let uvs_iter: Box<dyn Iterator<Item = Option<[(f64, f64); 3]>>> = match uvs {
+                    Some(uvs) => Box::new(uvs.iter().copied().map(Some)),
+                    None => Box::new(std::iter::repeat(None)),
+                };
+                Either::Right(triangles.iter().copied().zip(uvs_iter))
             }
-            Self::Sequential { triangles } => Either::Right(triangles.iter().copied()),
         }
     }
 }
@@ -1214,6 +1244,101 @@ fn make_point<'gc>([x, y]: &[Value<'gc>; 2]) -> Point<Twips> {
     let y = Twips::from_pixels(y.as_f64());
 
     Point::new(x, y)
+}
+
+/// Parses a `uvtData` `Vector.<Number>` into per-vertex (u, v) pairs.
+///
+/// Flash allows either 2 values per vertex (u, v) or 3 (u, v, t), where `t`
+/// enables perspective correction. `t` is not currently implemented, so it is
+/// parsed but discarded; UV mapping otherwise uses a plain per-triangle affine
+/// transform, which is correct as long as `t` is unused (the common case).
+///
+/// Returns `None` if the data doesn't have a length consistent with
+/// `num_vertices` (2 or 3 values per vertex), matching this being ignored
+/// rather than causing an error, similar to real Flash Player's behavior for
+/// malformed uvtData.
+fn parse_uvt_data<'gc>(uvt_data: &Object<'gc>, num_vertices: usize) -> Option<Box<[(f64, f64)]>> {
+    let storage = uvt_data.as_vector_storage()?;
+    let values = storage.storage();
+
+    if values.len() == num_vertices * 2 {
+        Some(
+            values
+                .as_chunks_exact::<2>()?
+                .iter()
+                .map(|[u, v]| (u.as_f64(), v.as_f64()))
+                .collect(),
+        )
+    } else if values.len() == num_vertices * 3 {
+        Some(
+            values
+                .as_chunks_exact::<3>()?
+                .iter()
+                .map(|[u, v, _t]| (u.as_f64(), v.as_f64()))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Computes the affine `FillStyle::Bitmap` matrix that maps a triangle's
+/// (u, v) texture coordinates (normalized 0..1 over the bitmap) onto its
+/// destination vertex positions, by solving the standard 3-point-correspondence
+/// affine system. This is what lets `Graphics.drawTriangles`/
+/// `GraphicsTrianglePath` texture-map a triangle mesh (e.g. a skinned
+/// character preview) instead of filling it with a single flat color.
+fn triangle_uv_matrix(
+    dest: [Point<Twips>; 3],
+    uv: [(f64, f64); 3],
+    bitmap_width: f64,
+    bitmap_height: f64,
+) -> Option<Matrix> {
+    // Source points, in the same "raw twips-as-pixel-index" space that
+    // `FillStyle::Bitmap`'s matrix operates in (see `begin_bitmap_fill`,
+    // which composes the user matrix with a *20 scale for the same reason).
+    let src: [(f64, f64); 3] = [
+        (uv[0].0 * bitmap_width, uv[0].1 * bitmap_height),
+        (uv[1].0 * bitmap_width, uv[1].1 * bitmap_height),
+        (uv[2].0 * bitmap_width, uv[2].1 * bitmap_height),
+    ];
+    let dst: [(f64, f64); 3] = [
+        (dest[0].x.get() as f64, dest[0].y.get() as f64),
+        (dest[1].x.get() as f64, dest[1].y.get() as f64),
+        (dest[2].x.get() as f64, dest[2].y.get() as f64),
+    ];
+
+    let u1 = src[1].0 - src[0].0;
+    let u2 = src[1].1 - src[0].1;
+    let v1 = src[2].0 - src[0].0;
+    let v2 = src[2].1 - src[0].1;
+    let p1 = dst[1].0 - dst[0].0;
+    let p2 = dst[1].1 - dst[0].1;
+    let q1 = dst[2].0 - dst[0].0;
+    let q2 = dst[2].1 - dst[0].1;
+
+    let det = u1 * v2 - u2 * v1;
+    // Degenerate (zero-area) UV triangle: no meaningful mapping exists.
+    if det.abs() < 0.001 {
+        return None;
+    }
+
+    let a = (p1 * v2 - u2 * q1) / det;
+    let c = (u1 * q1 - p1 * v1) / det;
+    let b = (p2 * v2 - u2 * q2) / det;
+    let d = (u1 * q2 - p2 * v1) / det;
+
+    let tx = dst[0].0 - (a * src[0].0 + c * src[0].1);
+    let ty = dst[0].1 - (b * src[0].0 + d * src[0].1);
+
+    Some(Matrix {
+        a: Fixed16::from_f64(a),
+        b: Fixed16::from_f64(b),
+        c: Fixed16::from_f64(c),
+        d: Fixed16::from_f64(d),
+        tx: Twips::new(tx.round() as i32),
+        ty: Twips::new(ty.round() as i32),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1261,14 +1386,49 @@ fn draw_triangles_internal<'gc>(
     drawing: &mut Drawing,
     vertices: &Object<'gc>,
     indices: Option<&Object<'gc>>,
-    _uvt_data: Option<&Object<'gc>>,
+    uvt_data: Option<&Object<'gc>>,
     culling: TriangleCulling,
 ) -> Result<(), Error<'gc>> {
-    let Some(data) = TriangleData::new(activation, vertices, indices)? else {
+    let Some(data) = TriangleData::new(activation, vertices, indices, uvt_data)? else {
         return Ok(());
     };
 
-    for [a, b, c] in data.iter_triangles().filter(|&tri| !culling.cull(tri)) {
+    // `uvtData` only has an effect when the active fill is a bitmap fill
+    // (matches Flash Player: for solid/gradient fills, uvtData is ignored).
+    // When it applies, each triangle gets its own bitmap fill matrix, solved
+    // from its (u, v) coordinates so the source texture is correctly mapped
+    // onto the destination triangle instead of being replaced by a flat fill.
+    let bitmap_fill = match drawing.current_fill_style() {
+        Some(FillStyle::Bitmap {
+            id,
+            is_smoothed,
+            is_repeating,
+            ..
+        }) => drawing
+            .bitmap_size(*id)
+            .map(|size| (*id, *is_smoothed, *is_repeating, size)),
+        _ => None,
+    };
+
+    for (tri, uv) in data.iter_triangles().filter(|&(tri, _)| !culling.cull(tri)) {
+        let [a, b, c] = tri;
+
+        if let (Some((id, is_smoothed, is_repeating, size)), Some(uv)) = (bitmap_fill, uv) {
+            if let Some(matrix) =
+                triangle_uv_matrix(tri, uv, size.width as f64, size.height as f64)
+            {
+                drawing.new_fill(
+                    Some(FillStyle::Bitmap {
+                        id,
+                        matrix,
+                        is_smoothed,
+                        is_repeating,
+                    }),
+                    None,
+                );
+            }
+        }
+
         drawing.draw_command(DrawCommand::MoveTo(a));
         drawing.draw_command(DrawCommand::LineTo(b));
         drawing.draw_command(DrawCommand::LineTo(c));
@@ -1618,15 +1778,6 @@ fn handle_graphics_triangle_path<'gc>(
             "drawGraphicsData",
             "GraphicsTrianglePath winding behavior"
         );
-
-        if uvt_data.is_some() {
-            avm2_stub_method!(
-                activation,
-                "flash.display.Graphics",
-                "drawGraphicsData",
-                "GraphicsTrianglePath with uvt data"
-            );
-        }
 
         draw_triangles_internal(
             activation,
