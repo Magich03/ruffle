@@ -244,6 +244,34 @@ impl QueueSyncHandle {
     }
 }
 
+/// Diagnostic-only counters for how many GPU textures are currently alive
+/// and their approximate combined size, logged periodically from
+/// `Texture::new`/`Drop`. Used to tell apart "textures are piling up
+/// uncollected" (a leak - this count climbs and never comes back down)
+/// from "there's just a lot of legitimately-alive content at once" (this
+/// count fluctuates but has a stable ceiling).
+static LIVE_TEXTURE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIVE_TEXTURE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TEXTURE_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn log_texture_stats(delta_bytes: i64) {
+    use std::sync::atomic::Ordering;
+    let count = LIVE_TEXTURE_COUNT.load(Ordering::Relaxed);
+    let bytes = if delta_bytes >= 0 {
+        LIVE_TEXTURE_BYTES.fetch_add(delta_bytes as usize, Ordering::Relaxed) + delta_bytes as usize
+    } else {
+        LIVE_TEXTURE_BYTES.fetch_sub((-delta_bytes) as usize, Ordering::Relaxed) - (-delta_bytes) as usize
+    };
+    // Log every 20th create/destroy event, not every single one, so this
+    // doesn't itself become a performance/log-spam problem.
+    if TEXTURE_EVENTS.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+        tracing::debug!(
+            "[texture-tracker] live_textures={count} live_bytes={bytes} ({:.1} MiB)",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
 #[derive(Debug)]
 pub struct Texture {
     pub(crate) texture: wgpu::Texture,
@@ -253,6 +281,21 @@ pub struct Texture {
 }
 
 impl Texture {
+    pub(crate) fn new(texture: wgpu::Texture) -> Self {
+        use std::sync::atomic::Ordering;
+        let size = texture.size();
+        let bytes_per_pixel = texture.format().block_copy_size(None).unwrap_or(4) as u64;
+        let approx_bytes = size.width as u64 * size.height as u64 * bytes_per_pixel;
+        LIVE_TEXTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        log_texture_stats(approx_bytes as i64);
+        Self {
+            texture,
+            bind_linear: Default::default(),
+            bind_nearest: Default::default(),
+            copy_count: Cell::new(0),
+        }
+    }
+
     pub fn bind_group(
         &self,
         smoothed: bool,
@@ -277,5 +320,16 @@ impl Texture {
                 create_debug_label!("Bitmap {:?} bind group (smoothed: {})", handle.0, smoothed),
             )
         })
+    }
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let size = self.texture.size();
+        let bytes_per_pixel = self.texture.format().block_copy_size(None).unwrap_or(4) as u64;
+        let approx_bytes = size.width as u64 * size.height as u64 * bytes_per_pixel;
+        LIVE_TEXTURE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        log_texture_stats(-(approx_bytes as i64));
     }
 }

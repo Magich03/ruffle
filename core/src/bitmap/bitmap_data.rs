@@ -555,7 +555,22 @@ mod wrapper {
         ) -> BitmapHandle {
             let mut bitmap_data = self.0.borrow_mut(gc_context);
             bitmap_data.update_dirty_texture(renderer);
-            bitmap_data.bitmap_handle(renderer)
+            // `bitmap_handle` (below) lazily registers a GPU texture the
+            // first time it's needed. That texture can be many MB, but the
+            // BitmapRawData struct anchoring it is tiny from gc-arena's
+            // point of view (`#[collect(no_drop)]`, no external-byte
+            // tracking), so the collector's pacing has no idea this
+            // allocation happened and doesn't speed up collection to
+            // compensate - garbage BitmapData objects (and the textures
+            // they hold) pile up far longer than they should under
+            // texture-heavy content. Report it explicitly so pacing can see it.
+            let had_handle = bitmap_data.bitmap_handle.is_some();
+            let handle = bitmap_data.bitmap_handle(renderer);
+            if !had_handle {
+                let bytes = bitmap_data.width as u64 * bitmap_data.height as u64 * 4;
+                gc_context.metrics().mark_external_allocation(bytes as usize);
+            }
+            handle
         }
 
         /// Provides access to the underlying `BitmapData`.
@@ -635,7 +650,12 @@ mod wrapper {
         }
 
         pub fn dispose(&self, mc: &Mutation<'gc>) {
-            self.0.borrow_mut(mc).dispose();
+            let mut data = self.0.borrow_mut(mc);
+            if data.bitmap_handle.is_some() {
+                let bytes = data.width as u64 * data.height as u64 * 4;
+                mc.metrics().mark_external_deallocation(bytes as usize);
+            }
+            data.dispose();
         }
 
         pub fn init_object2(&self, mc: &Mutation<'gc>, object: BitmapDataObject<'gc>) {

@@ -679,12 +679,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
-        let handle = BitmapHandle(Arc::new(Texture {
-            texture,
-            bind_linear: Default::default(),
-            bind_nearest: Default::default(),
-            copy_count: Cell::new(0),
-        }));
+        let handle = BitmapHandle(Arc::new(Texture::new(texture)));
 
         Ok(handle)
     }
@@ -953,12 +948,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
-                BitmapHandle(Arc::new(Texture {
-                    texture,
-                    bind_linear: Default::default(),
-                    bind_nearest: Default::default(),
-                    copy_count: Cell::new(0),
-                }))
+                BitmapHandle(Arc::new(Texture::new(texture)))
             }
         };
 
@@ -1111,12 +1101,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
-        Ok(BitmapHandle(Arc::new(Texture {
-            texture,
-            bind_linear: Default::default(),
-            bind_nearest: Default::default(),
-            copy_count: Cell::new(0),
-        })))
+        Ok(BitmapHandle(Arc::new(Texture::new(texture))))
     }
 
     fn resolve_sync_handle(
